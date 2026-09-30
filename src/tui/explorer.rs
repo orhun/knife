@@ -7,7 +7,11 @@
 //! parts (sorting, filtering, ascending) are tested without a terminal.
 
 use super::render;
-use anyhow::Result;
+use ::molerat::{
+    accesskit::{Action, ActionData},
+    Molerat,
+};
+use anyhow::{Context, Result};
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line as TLine, Span};
@@ -37,6 +41,20 @@ pub struct Explorer {
     pub quit: bool,
     /// The file the user asked to open; the caller hands it to the workspace.
     pub chosen: Option<PathBuf>,
+}
+
+#[derive(Debug)]
+enum Message {
+    Key(KeyEvent),
+    Select(usize),
+    Activate(usize),
+    Ascend,
+    OpenFilter,
+    SetFilter(Option<String>),
+    CloseFilter,
+    ShowHelp,
+    DismissHelp,
+    Quit,
 }
 
 /// What the first bytes of a file claim it is; unknown stays unknown rather
@@ -221,6 +239,10 @@ impl Explorer {
     }
 
     pub fn on_key(&mut self, key: KeyEvent) {
+        let _ = self.update(Message::Key(key));
+    }
+
+    fn handle_key(&mut self, key: KeyEvent) {
         if key.kind != KeyEventKind::Press {
             return; // Windows reports releases too; acting on both double-fires
         }
@@ -266,28 +288,143 @@ impl Explorer {
             _ => {}
         }
     }
+
+    fn update(&mut self, message: Message) -> bool {
+        match message {
+            Message::Key(key) => {
+                if key.kind != KeyEventKind::Press {
+                    return false;
+                }
+                self.handle_key(key);
+            }
+            Message::Select(index) => {
+                if index >= self.visible.len() {
+                    return false;
+                }
+                self.selection = index;
+            }
+            Message::Activate(index) => {
+                if index >= self.visible.len() {
+                    return false;
+                }
+                self.selection = index;
+                self.activate();
+            }
+            Message::Ascend => self.ascend(),
+            Message::OpenFilter => self.filtering = true,
+            Message::SetFilter(Some(filter)) => {
+                self.filter = filter;
+                self.apply_filter();
+            }
+            Message::SetFilter(None) => return false,
+            Message::CloseFilter => self.filtering = false,
+            Message::ShowHelp => self.help = true,
+            Message::DismissHelp => self.help = false,
+            Message::Quit => self.quit = true,
+        }
+        true
+    }
+
+    fn publish(&self, molerat: &mut Molerat<Message>) {
+        molerat.publish(|ui| {
+            ui.text("directory", format!("Directory: {}", self.dir.display()));
+            if self.help {
+                ui.command("close-help", "Close explorer help", || {
+                    Message::DismissHelp
+                });
+                ui.paragraph(
+                    "help",
+                    "Select a directory to enter it or a file to open it in the analysis workspace. Use the filter to match names, ascend to open the parent directory, or quit to leave Knife.",
+                )
+                .label("File explorer help")
+                .focused(true)
+                .custom_action("close", "Close explorer help", || Message::DismissHelp);
+                return;
+            }
+            if self.filtering {
+                ui.group("filter-prompt", "Filter entries", |ui| {
+                    ui.text_input("filter", "Filename filter", &self.filter)
+                        .focused(true)
+                        .on_action(Action::SetValue, |request| {
+                            Message::SetFilter(match request.data.as_ref() {
+                                Some(ActionData::Value(value)) => Some(value.to_string()),
+                                _ => None,
+                            })
+                        });
+                    ui.button("done", "Finish filtering")
+                        .on_click(|| Message::CloseFilter);
+                });
+                return;
+            }
+
+            ui.command("ascend", "Open the parent directory", || Message::Ascend);
+            ui.command("filter", "Filter entries by name", || Message::OpenFilter);
+            ui.command("help", "Show explorer help", || Message::ShowHelp);
+            ui.command("quit", "Quit Knife", || Message::Quit);
+            ui.list_box("entries", "Files and directories", |ui| {
+                for (position, &entry_index) in self.visible.iter().enumerate() {
+                    let entry = &self.entries[entry_index];
+                    let kind = if entry.is_dir {
+                        "directory".to_owned()
+                    } else {
+                        format!(
+                            "{} file, {}",
+                            entry.format.unwrap_or("unrecognized"),
+                            format_size(entry.size)
+                        )
+                    };
+                    ui.list_box_option(&entry.name, &entry.name)
+                        .description(kind)
+                        .selected(position == self.selection)
+                        .focused(position == self.selection)
+                        .on_focus(move || Message::Select(position))
+                        .on_click(move || Message::Select(position))
+                        .custom_action("open", "Open this entry", move || {
+                            Message::Activate(position)
+                        });
+                }
+            });
+            if !self.status.is_empty() {
+                ui.status("operation-status", &self.status);
+            }
+        });
+    }
 }
 
 /// Pick a target, or nothing when the user quits. The terminal is restored
 /// before returning so the workspace can take it over next.
 pub fn run(start: &Path) -> Result<Option<PathBuf>> {
+    let mut molerat = Molerat::<Message>::new_mcp("Knife explorer")
+        .context("cannot start the Molerat MCP endpoint for the explorer")?;
     let mut term =
         ratatui::try_init().map_err(|e| anyhow::anyhow!("cannot start the explorer: {e}"))?;
     let mut explorer = Explorer::new(start);
+    explorer.publish(&mut molerat);
     let res = loop {
         if let Err(e) = term.draw(|f| draw(f, &explorer)) {
             break Err(anyhow::Error::from(e));
         }
-        match event::read() {
-            Ok(Event::Key(k)) => explorer.on_key(k),
-            Ok(_) => {}
-            Err(e) => break Err(anyhow::Error::from(e)),
+        let mut changed = false;
+        match event::poll(std::time::Duration::from_millis(100)) {
+            Ok(true) => match event::read() {
+                Ok(Event::Key(key)) => changed |= explorer.update(Message::Key(key)),
+                Ok(_) => {}
+                Err(error) => break Err(anyhow::Error::from(error)),
+            },
+            Ok(false) => {}
+            Err(error) => break Err(anyhow::Error::from(error)),
+        }
+        for message in molerat.messages() {
+            changed |= explorer.update(message);
         }
         if let Some(path) = explorer.chosen.take() {
             break Ok(Some(path));
         }
         if explorer.quit {
             break Ok(None);
+        }
+        if changed {
+            explorer.publish(&mut molerat);
         }
     };
     ratatui::restore();
@@ -566,6 +703,49 @@ mod tests {
         assert!(out.contains("sample.exe"), "targets are listed");
         assert!(out.contains("PE"), "the format badge is drawn");
         assert!(out.contains("? help"), "help stays discoverable");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn semantic_explorer_routes_selection_and_exposes_filter_input() {
+        use ::molerat::accesskit::{Action, ActionRequest, Role, TreeId};
+
+        let dir = sample_dir("semantic");
+        let mut explorer = Explorer::new(&dir);
+        let mut molerat = Molerat::<Message>::new("Knife explorer");
+        explorer.publish(&mut molerat);
+        let update = molerat.last_update().expect("explorer snapshot");
+        let sample = update
+            .nodes
+            .iter()
+            .find(|(_, node)| node.label() == Some("sample.exe"))
+            .map(|(id, _)| *id)
+            .expect("sample entry");
+        assert!(molerat.handle_action(ActionRequest {
+            action: Action::Click,
+            target_tree: TreeId::ROOT,
+            target_node: sample,
+            data: None,
+        }));
+        for message in molerat.messages() {
+            assert!(explorer.update(message));
+        }
+        assert_eq!(
+            explorer.selected().map(|entry| entry.name.as_str()),
+            Some("sample.exe")
+        );
+
+        assert!(explorer.update(Message::OpenFilter));
+        explorer.publish(&mut molerat);
+        let filtered = molerat.last_update().expect("filter snapshot");
+        assert!(filtered
+            .nodes
+            .iter()
+            .any(|(id, node)| { *id == filtered.focus && node.role() == Role::TextInput }));
+        assert!(!filtered
+            .nodes
+            .iter()
+            .any(|(_, node)| node.label() == Some("sample.exe")));
         std::fs::remove_dir_all(&dir).ok();
     }
 }

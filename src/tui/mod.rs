@@ -16,7 +16,9 @@ mod navigation;
 #[cfg(feature = "record")]
 pub mod record;
 mod render;
+mod semantic;
 pub use navigation::NavigationLocation;
+use semantic::Message;
 mod splash;
 
 const GRAPH_NODE_WIDTH: u16 = 7;
@@ -2288,11 +2290,13 @@ impl App {
 
     /// Collect a finished reload, if there is one. Applied state replaces the
     /// session wholesale; a failure keeps the old session untouched.
-    pub fn poll_reload(&mut self) {
-        let Some(rx) = &self.reloading else { return };
+    pub fn poll_reload(&mut self) -> bool {
+        let Some(rx) = &self.reloading else {
+            return false;
+        };
         let outcome = match rx.try_recv() {
             Ok(outcome) => outcome,
-            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return false,
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 Err(anyhow::anyhow!("the reload worker died"))
             }
@@ -2304,6 +2308,7 @@ impl App {
                 self.status = format!("reload failed, kept the old session: {error:#}");
             }
         }
+        true
     }
 
     fn apply_reload(&mut self, outcome: ReloadOutcome) {
@@ -2390,6 +2395,10 @@ impl App {
     // ── input ──
 
     pub fn on_key(&mut self, key: KeyEvent) {
+        let _ = self.update(Message::Key(key));
+    }
+
+    fn handle_key(&mut self, key: KeyEvent) {
         if key.kind != KeyEventKind::Press {
             return; // Windows reports releases too; acting on both double-fires
         }
@@ -2902,6 +2911,10 @@ impl App {
     }
 
     pub fn on_mouse(&mut self, m: MouseEvent) {
+        let _ = self.update(Message::Mouse(m));
+    }
+
+    fn handle_mouse(&mut self, m: MouseEvent) {
         self.activate_column_at(m.column, m.row);
         match m.kind {
             MouseEventKind::ScrollUp => self.step(-1),
@@ -3161,6 +3174,16 @@ fn parse_prototype(text: &str) -> Result<(String, Vec<String>), String> {
 /// large binary leaves the terminal responsive;
 /// `q` / Esc / Ctrl-C quit even while it is still working.
 pub fn run(source: TargetSource, bin: Binary, bytes: Vec<u8>, db: Db, title: String) -> Result<()> {
+    let mut molerat = ::molerat::Molerat::<Message>::new_mcp("Knife")
+        .context("cannot start the Molerat MCP endpoint")?;
+    molerat.publish(|ui| {
+        ui.text("target", format!("Target: {title}"));
+        ui.status(
+            "analysis-status",
+            "Recovering functions and preparing analysis views",
+        );
+    });
+
     // Keep initial analysis, string mapping and driver reporting off the UI thread.
     let (tx, rx) = std::sync::mpsc::channel::<WorkResult>();
     std::thread::spawn(move || {
@@ -3254,6 +3277,7 @@ pub fn run(source: TargetSource, bin: Binary, bytes: Vec<u8>, db: Db, title: Str
     // opens on its mapped bytes and the catalogs stay available.
     let mut app = App::new(bin, bytes, db, an, sinks, strings, driver, title);
     app.source = Some(source);
+    app.publish(&mut molerat);
     let res = loop {
         if let Ok(area) = term.size() {
             app.dims = (area.width, area.height);
@@ -3261,30 +3285,27 @@ pub fn run(source: TargetSource, bin: Binary, bytes: Vec<u8>, db: Db, title: Str
         if let Err(e) = term.draw(|f| render::draw(f, &app)) {
             break Err(e.into());
         }
-        app.poll_reload();
-        if app.is_reloading() {
-            // A reload has a worker in flight: poll with a timeout so the
-            // result is applied promptly instead of waiting for input.
-            match event::poll(Duration::from_millis(100)) {
-                Ok(true) => match event::read() {
-                    Ok(Event::Key(k)) => app.on_key(k),
-                    Ok(Event::Mouse(_)) | Ok(_) => {}
-                    Err(e) => break Err(e.into()),
-                },
-                Ok(false) => {}
-                Err(e) => break Err(e.into()),
-            }
-        } else {
-            // No background work remains: block until input/resize instead of redrawing idle frames.
-            match event::read() {
-                Ok(Event::Key(k)) => app.on_key(k),
-                Ok(Event::Mouse(m)) => app.on_mouse(m),
+        let mut changed = app.poll_reload();
+        // A short poll keeps Molerat actions responsive without a second runtime
+        // or worker touching application state.
+        match event::poll(Duration::from_millis(100)) {
+            Ok(true) => match event::read() {
+                Ok(Event::Key(key)) => changed |= app.update(Message::Key(key)),
+                Ok(Event::Mouse(mouse)) => changed |= app.update(Message::Mouse(mouse)),
                 Ok(_) => {}
-                Err(e) => break Err(e.into()),
-            }
+                Err(error) => break Err(error.into()),
+            },
+            Ok(false) => {}
+            Err(error) => break Err(error.into()),
+        }
+        for message in molerat.messages() {
+            changed |= app.update(message);
         }
         if app.quit {
             break Ok(());
+        }
+        if changed {
+            app.publish(&mut molerat);
         }
     };
     let _ = ratatui::crossterm::execute!(&mut stdout(), event::DisableMouseCapture);
@@ -3451,6 +3472,67 @@ mod tests {
         let app = two_functions();
         assert!(app.cur.is_some(), "a pane should never start empty");
         assert!(!app.lines.is_empty());
+    }
+
+    #[test]
+    fn semantic_tree_exposes_state_and_routes_actions_through_messages() {
+        use ::molerat::accesskit::{Action, ActionRequest, Role, TreeId};
+        use std::collections::BTreeSet;
+
+        let mut app = two_functions();
+        let mut molerat = ::molerat::Molerat::<Message>::new("Knife");
+        app.publish(&mut molerat);
+
+        let update = molerat.last_update().expect("semantic snapshot");
+        assert!(update
+            .nodes
+            .iter()
+            .any(|(_, node)| node.role() == Role::ListBox));
+        assert!(update
+            .nodes
+            .iter()
+            .any(|(id, node)| node.role() == Role::ListBoxOption && *id == update.focus));
+        assert!(update.nodes[0].1.custom_actions().len() >= 10);
+        let ids = update
+            .nodes
+            .iter()
+            .map(|(id, _)| id.0)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            ids.len(),
+            update.nodes.len(),
+            "semantic node IDs are unique"
+        );
+
+        let second = app.an.functions[1].addr;
+        let label = format!("0x{second:x} ");
+        let target_node = update
+            .nodes
+            .iter()
+            .find(|(_, node)| {
+                node.role() == Role::ListBoxOption
+                    && node.label().is_some_and(|value| value.starts_with(&label))
+            })
+            .map(|(id, _)| *id)
+            .expect("second function option");
+        assert!(molerat.handle_action(ActionRequest {
+            action: Action::Click,
+            target_tree: TreeId::ROOT,
+            target_node,
+            data: None,
+        }));
+        for message in molerat.messages() {
+            assert!(app.update(message));
+        }
+        assert_eq!(app.selected_addr(), Some(second));
+
+        app.publish(&mut molerat);
+        let republished = molerat.last_update().expect("updated semantic snapshot");
+        assert_eq!(republished.focus, target_node);
+        assert!(republished
+            .nodes
+            .iter()
+            .any(|(id, node)| *id == target_node && node.is_selected() == Some(true)));
     }
 
     #[test]
